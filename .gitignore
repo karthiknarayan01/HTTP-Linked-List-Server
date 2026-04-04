@@ -1,0 +1,3 @@
+listd
+src/*.o
+src/*.d
