@@ -62,7 +62,7 @@ private:
     std::vector<Route> routes_;
 };
 
-// ─── HTTP server (poll-based event loop) ──────────────────────────────────────
+// ─── HTTP server (epoll, Linux only) ─────────────────────────────────────────
 
 class HttpServer {
 public:
@@ -77,6 +77,7 @@ private:
     std::string host_;
     int port_;
     int listen_fd_;
+    int poller_fd_; // epoll fd
     bool running_;
     Router* router_;
 
@@ -89,5 +90,9 @@ private:
     std::unordered_map<int, Connection> connections_;
 
     void setup_socket();
+    void setup_poller();
+    void poller_watch_read(int fd);
+    void poller_watch_write(int fd);
+    void poller_remove(int fd);
     bool try_parse_request(const std::string& raw, HttpRequest& req);
 };

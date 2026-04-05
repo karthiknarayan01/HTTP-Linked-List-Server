@@ -6,12 +6,14 @@
 #include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
-#include <poll.h>
 #include <sstream>
 #include <stdexcept>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <algorithm>
+
+static constexpr int kMaxEvents = 1024;
 
 // ─── HttpResponse ─────────────────────────────────────────────────────────────
 
@@ -145,13 +147,11 @@ static void set_nonblocking(int fd) {
 }
 
 HttpServer::HttpServer(const std::string& host, int port)
-    : host_(host), port_(port), listen_fd_(-1), running_(false), router_(nullptr) {}
+    : host_(host), port_(port), listen_fd_(-1), poller_fd_(-1), running_(false), router_(nullptr) {}
 
 HttpServer::~HttpServer() {
-    if (listen_fd_ >= 0) {
-        close(listen_fd_);
-        listen_fd_ = -1;
-    }
+    if (poller_fd_ >= 0) { close(poller_fd_); poller_fd_ = -1; }
+    if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; }
 }
 
 void HttpServer::use(Router& router) {
@@ -181,11 +181,9 @@ void HttpServer::setup_socket() {
 }
 
 bool HttpServer::try_parse_request(const std::string& raw, HttpRequest& req) {
-    static const std::string kHeaderEnd = "\r\n\r\n";
-    size_t hdr_end = raw.find(kHeaderEnd);
+    size_t hdr_end = raw.find("\r\n\r\n");
     if (hdr_end == std::string::npos) return false;
 
-    // Request line
     size_t line_end = raw.find("\r\n");
     {
         std::istringstream rls(raw.substr(0, line_end));
@@ -194,11 +192,9 @@ bool HttpServer::try_parse_request(const std::string& raw, HttpRequest& req) {
     }
     if (req.method.empty()) return false;
 
-    // Strip query string
     auto q = req.path.find('?');
     if (q != std::string::npos) req.path = req.path.substr(0, q);
 
-    // Parse headers
     size_t pos = line_end + 2;
     while (pos < hdr_end) {
         size_t end = raw.find("\r\n", pos);
@@ -215,79 +211,101 @@ bool HttpServer::try_parse_request(const std::string& raw, HttpRequest& req) {
         pos = end + 2;
     }
 
-    // Read body if Content-Length is present
     size_t body_start = hdr_end + 4;
     auto it = req.headers.find("content-length");
     if (it != req.headers.end()) {
         size_t content_len = static_cast<size_t>(std::stoi(it->second));
-        if (raw.size() < body_start + content_len) return false; // incomplete
+        if (raw.size() < body_start + content_len) return false;
         req.body = raw.substr(body_start, content_len);
     }
 
     return true;
 }
 
+// ─── epoll helpers ────────────────────────────────────────────────────────────
+
+void HttpServer::setup_poller() {
+    poller_fd_ = epoll_create1(EPOLL_CLOEXEC);
+    if (poller_fd_ < 0)
+        throw std::runtime_error(std::string("epoll_create1() failed: ") + strerror(errno));
+}
+
+void HttpServer::poller_watch_read(int fd) {
+    struct epoll_event ev{};
+    ev.events  = EPOLLIN | EPOLLET;
+    ev.data.fd = fd;
+    epoll_ctl(poller_fd_, EPOLL_CTL_ADD, fd, &ev);
+}
+
+void HttpServer::poller_watch_write(int fd) {
+    struct epoll_event ev{};
+    ev.events  = EPOLLOUT | EPOLLET;
+    ev.data.fd = fd;
+    epoll_ctl(poller_fd_, EPOLL_CTL_MOD, fd, &ev);
+}
+
+void HttpServer::poller_remove(int fd) {
+    epoll_ctl(poller_fd_, EPOLL_CTL_DEL, fd, nullptr);
+}
+
 // ─── Event loop ───────────────────────────────────────────────────────────────
 //
-// Architecture: single-threaded, non-blocking I/O using poll().
+// Edge-triggered epoll: the kernel notifies us once per state change, so every
+// read/write handler must drain its fd fully (loop until EAGAIN) before
+// returning control to epoll_wait.
 //
-//  1. A non-blocking listening socket is polled for POLLIN (new connections).
-//  2. Accepted client sockets are polled for POLLIN (incoming request data).
-//  3. When a complete HTTP request is buffered, it is dispatched synchronously
-//     and the serialised response is placed in a per-connection send buffer.
-//  4. The client socket is then polled for POLLOUT until the send buffer drains,
-//     after which the connection is closed (HTTP/1.0 close-after-response style).
+//  1. listen_fd_ fires EPOLLIN → accept() loop until EAGAIN; each new client
+//     fd is set non-blocking and registered for reads.
+//  2. Client fd fires EPOLLIN → recv() loop until EAGAIN; once a complete HTTP
+//     request is buffered, dispatch it, store the response, re-arm for writes.
+//  3. Client fd fires EPOLLOUT → send() loop until EAGAIN or buffer empty;
+//     empty buffer means the response is fully delivered → close.
 
 void HttpServer::run() {
     setup_socket();
+    setup_poller();
     running_ = true;
-
-    std::vector<struct pollfd> pfds;
-    pfds.push_back({listen_fd_, POLLIN, 0});
+    poller_watch_read(listen_fd_);
 
     std::cout << "Server listening on " << host_ << ":" << port_ << "\n"
               << "Press Ctrl+C to stop.\n";
 
+    std::vector<struct epoll_event> events(kMaxEvents);
+
     while (running_) {
-        int ready = poll(pfds.data(), static_cast<nfds_t>(pfds.size()), 500 /*ms timeout*/);
-        if (ready < 0) {
-            if (errno == EINTR) continue; // signal interrupted poll, just loop
+        int nready = epoll_wait(poller_fd_, events.data(), kMaxEvents, 500 /*ms*/);
+        if (nready < 0) {
+            if (errno == EINTR) continue;
             break;
         }
 
-        // Snapshot size so push_backs from accept() don't affect this iteration
-        const size_t n = pfds.size();
-        std::vector<size_t> to_close_idx;
+        for (int i = 0; i < nready; ++i) {
+            int  fd       = events[i].data.fd;
+            bool is_read  = events[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP);
+            bool is_write = events[i].events & EPOLLOUT;
 
-        for (size_t i = 0; i < n; ++i) {
-            if (!pfds[i].revents) continue;
-
-            // ── Listening socket: accept new connections ──────────────────
-            if (pfds[i].fd == listen_fd_) {
+            if (fd == listen_fd_) {
                 int cfd;
                 while ((cfd = accept(listen_fd_, nullptr, nullptr)) >= 0) {
                     set_nonblocking(cfd);
                     connections_[cfd] = {cfd, {}, {}};
-                    pfds.push_back({cfd, POLLIN, 0});
+                    poller_watch_read(cfd);
                 }
                 continue;
             }
 
-            // ── Client socket ─────────────────────────────────────────────
-            int fd = pfds[i].fd;
             bool close_conn = false;
 
-            if (pfds[i].revents & (POLLERR | POLLHUP)) {
-                close_conn = true;
-
-            } else if (pfds[i].revents & POLLIN) {
+            if (is_read) {
+                auto& conn = connections_[fd];
                 char buf[4096];
-                ssize_t r = recv(fd, buf, sizeof(buf), 0);
-                if (r <= 0) {
+                ssize_t r;
+                while ((r = recv(fd, buf, sizeof(buf), 0)) > 0)
+                    conn.recv_buf.append(buf, static_cast<size_t>(r));
+
+                if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
                     close_conn = true;
                 } else {
-                    auto& conn = connections_[fd];
-                    conn.recv_buf.append(buf, static_cast<size_t>(r));
                     HttpRequest req;
                     if (try_parse_request(conn.recv_buf, req)) {
                         HttpResponse resp = router_
@@ -295,32 +313,39 @@ void HttpServer::run() {
                             : HttpResponse::internal_error("No router configured");
                         conn.send_buf = resp.serialize();
                         conn.recv_buf.clear();
-                        pfds[i].events = POLLOUT; // switch to write mode
+                        poller_watch_write(fd);
                     }
                 }
+            }
 
-            } else if (pfds[i].revents & POLLOUT) {
+            if (is_write && !close_conn) {
                 auto& conn = connections_[fd];
-                ssize_t w = send(fd, conn.send_buf.data(), conn.send_buf.size(), 0);
-                if (w > 0) conn.send_buf.erase(0, static_cast<size_t>(w));
+                ssize_t w;
+                while (!conn.send_buf.empty()) {
+                    w = send(fd, conn.send_buf.data(), conn.send_buf.size(), 0);
+                    if (w > 0) {
+                        conn.send_buf.erase(0, static_cast<size_t>(w));
+                    } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        break;
+                    } else {
+                        close_conn = true;
+                        break;
+                    }
+                }
                 if (conn.send_buf.empty()) close_conn = true;
             }
 
             if (close_conn) {
-                to_close_idx.push_back(i);
+                poller_remove(fd);
                 close(fd);
                 connections_.erase(fd);
             }
         }
-
-        // Remove closed entries from pfds in reverse order to preserve indices
-        for (auto it = to_close_idx.rbegin(); it != to_close_idx.rend(); ++it)
-            pfds.erase(pfds.begin() + static_cast<std::ptrdiff_t>(*it));
     }
 
-    // Cleanup on shutdown
     for (auto& [fd, _] : connections_) close(fd);
     connections_.clear();
+    if (poller_fd_ >= 0) { close(poller_fd_); poller_fd_ = -1; }
     if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; }
 }
 
