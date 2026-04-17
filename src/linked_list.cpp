@@ -121,6 +121,8 @@ Node* LinkedList::node_at(int position) const {
 }
 
 int LinkedList::get_at(int position) const {
+    if (position <= 0)
+        throw std::runtime_error("Position must be >= 1");
     Node* node = node_at(position);
     if (node == nullptr)
         throw std::runtime_error("Position out of range");
